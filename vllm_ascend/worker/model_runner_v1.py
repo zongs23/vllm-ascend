@@ -2323,8 +2323,6 @@ class NPUModelRunner(GPUModelRunner):
         num_attn_module = 2 if self.model_config.hf_text_config.model_type == "longcat_flash" else 1
         bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
         return kv_caches
-
-
     def _allocate_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, alignment: int
     ) -> dict[str, torch.Tensor]:
