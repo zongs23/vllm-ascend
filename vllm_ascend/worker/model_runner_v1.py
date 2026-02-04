@@ -2307,10 +2307,11 @@ class NPUModelRunner(GPUModelRunner):
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        alignment = 2 * 1024 * 1024
         # Initialize the memory buffer for KV cache
-        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config, alignment)
         # Change the memory buffer to the desired shape
-        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
+        kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors, alignment)
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -2323,7 +2324,44 @@ class NPUModelRunner(GPUModelRunner):
         bind_kv_cache(kv_caches, self.compilation_config.static_forward_context, self.kv_caches, num_attn_module)
         return kv_caches
 
-    def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
+
+    def _allocate_kv_cache_tensors(
+        self, kv_cache_config: KVCacheConfig, alignment: int
+    ) -> dict[str, torch.Tensor]:
+        """
+        Initializes the KV cache buffer with the correct size. The buffer needs
+        to be reshaped to the desired shape before being used by the models.
+
+        Args:
+            kv_cache_config: The KV cache config
+        Returns:
+            dict[str, tuple[torch.Tensor, list[int]]]: A map between layer names to their
+            corresponding memory buffer and split type for KV cache.
+        """
+        kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, list[int]]] = {}
+        kv_cache_split_size_list, new_alignment = self._cal_kv_cache_tensor_split_size(kv_cache_config, alignment)
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            tensor = torch.zeros(
+                kv_cache_tensor.size + new_alignment, dtype=torch.int8, device=self.device
+            )
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_cache_split = kv_cache_split_size_list
+                total_size = sum(kv_cache_split)
+                assert total_size == kv_cache_tensor.size + new_alignment
+                kv_cache_raw_tensors[layer_name] = (tensor, kv_cache_split)
+
+        layer_names = set()
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                if layer_name in self.runner_only_attn_layers:
+                    continue
+                layer_names.add(layer_name)
+        assert layer_names == set(kv_cache_raw_tensors.keys()), (
+            "Some layers are not correctly initialized"
+        )
+        return kv_cache_raw_tensors
+
+    def _cal_kv_cache_tensor_split_size(self, kv_cache_config: KVCacheConfig, alignment: int) -> dict[str, list[int]]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -2340,27 +2378,24 @@ class NPUModelRunner(GPUModelRunner):
             to their corresponding memory buffer for K cache and V cache.
         """
         # init kv cache tensors
-        kv_cache_raw_tensors: dict[str, torch.Tensor | torch.Tensor | None] = {}
+        kv_cache_split_size_list: dict[str, list[int]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
-        alignment = 2 * 1024 * 1024
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # TODO: REFACTOR ME to sharing hybrid cache
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
-                if "linear_attn" in layer_name and layer_name not in kv_cache_raw_tensors:
+                if "linear_attn" in layer_name and layer_name not in kv_cache_split_size_list:
                     # for mamba linear attention
-                    if self.vllm_config.kv_transfer_config is None:
-                        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
-                    else:
-                        cache_size_aligned = kv_cache_tensor.size + alignment
-                        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+                    tensor_size = kv_cache_tensor.size
+                    if self.vllm_config.kv_transfer_config is not None:
+                        tensor_size += alignment
+                    split_size_list = [tensor_size]
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if "linear_attn" in layer_name_inner:
-                            kv_cache_raw_tensors[layer_name_inner] = tensor
-                elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors:
+                            kv_cache_split_size_list[layer_name_inner] = split_size_list
+                elif "attn" in layer_name and layer_name not in kv_cache_split_size_list:
                     # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
                     # v cache tensor (rope cache tensor in mla) separately to support prefill disaggregation,
                     # as it only support the 0-dim of kv_cache is `num_blocks`.
@@ -2393,49 +2428,27 @@ class NPUModelRunner(GPUModelRunner):
 
                     k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
                     v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
-
-                    # for other attentions, e.g., self_attn, sliding window attn
-                    if self.vllm_config.kv_transfer_config is None:
-                        k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=self.device)
-                        #### k cache: for deepseek sparse attention
-                        if dsa_k_cache_factor is not None:
-                            dsa_k_cache_tensor = torch.zeros(dsa_k_cache_size, dtype=torch.int8, device=self.device)
-                    else:
-                        k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
-                        v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
-                        #### k cache: for deepseek sparse attention
+                    if self.vllm_config.kv_transfer_config is not None:
+                        k_tensor_size += alignment
+                        v_tensor_size += alignment
                         if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
-                            dsa_k_cache_tensor = torch.zeros(
-                                dsa_k_cache_size + alignment, dtype=torch.int8, device=self.device
-                            )
-                            dsa_k_cache_tensor = self._align_memory(dsa_k_cache_tensor, alignment)[:dsa_k_cache_size]
+                            dsa_k_cache_size += alignment
+
+                    split_size_list = [k_tensor_size, v_tensor_size]
+                    if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
+                        split_size_list.append(dsa_k_cache_size)
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            kv_cache_raw_tensors[layer_name_inner] = (
-                                (k_tensor, v_tensor)
-                                if not self.use_sparse
-                                else (k_tensor, v_tensor, dsa_k_cache_tensor)
-                            )
-
-        layer_names = set()
-        for group in kv_cache_config.kv_cache_groups:
-            for layer_name in group.layer_names:
-                if layer_name in self.runner_only_attn_layers:
-                    continue
-                layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
-
-        return kv_cache_raw_tensors
+                            kv_cache_split_size_list[layer_name_inner] = split_size_list
+        return kv_cache_split_size_list
 
     def _reshape_kv_cache_tensors(
         self,
         kv_cache_config: KVCacheConfig,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
+        alignment: int
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -2460,17 +2473,31 @@ class NPUModelRunner(GPUModelRunner):
                 # encounter OOM issue
                 if isinstance(kv_cache_spec, AttentionSpec):
                     raw_dsa_k_tensor = None
+                    raw_tensor = kv_cache_raw_tensors[layer_name][0]
+                    
+                    offset = 0
+                    k_tensor_size = kv_cache_raw_tensors[layer_name][1][0]
+                    raw_k_tensor = raw_tensor[offset: offset + k_tensor_size]
+                    offset += k_tensor_size
+                    
+                    v_tensor_size = kv_cache_raw_tensors[layer_name][1][1]
+                    raw_v_tensor = raw_tensor[offset: offset + v_tensor_size]
+                    offset += v_tensor_size
+
+                    if self.vllm_config.kv_transfer_config is not None:
+                        raw_k_tensor = self._align_memory(raw_k_tensor, alignment)[:k_tensor_size - alignment]
+                        raw_v_tensor = self._align_memory(raw_v_tensor, alignment)[:v_tensor_size - alignment]
+
+                    sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     if self.use_sparse:
-                        raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor = kv_cache_raw_tensors[  # type: ignore
-                            layer_name
-                        ]
+                        dsa_k_size = kv_cache_raw_tensors[layer_name][1][2]
+                        raw_dsa_k_tensor = raw_tensor[offset: offset + dsa_k_size]
                         assert raw_dsa_k_tensor is not None
-                        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel() + raw_dsa_k_tensor.numel()
-                    else:
-                        raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
-                            layer_name
-                        ]
-                        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                        sum_page_size_bytes += raw_dsa_k_tensor.numel()
+                        if self.vllm_config.kv_transfer_config is not None:
+                            raw_dsa_k_tensor = self._align_memory(raw_dsa_k_tensor, alignment)[:dsa_k_size - alignment]
+
+                    
                     assert raw_k_tensor is not None
                     assert raw_v_tensor is not None
                     assert sum_page_size_bytes % kv_cache_spec.page_size_bytes == 0
@@ -2529,7 +2556,10 @@ class NPUModelRunner(GPUModelRunner):
                     else:
                         kv_caches[layer_name] = (k_cache, v_cache)
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    raw_tensor = kv_cache_raw_tensors[layer_name][0]
+                    if self.use_sparse and raw_dsa_k_tensor is not None:
+                        raw_tensor = self._align_memory(raw_tensor, alignment)[:kv_cache_raw_tensors[layer_name][1][0] - alignment]
+
                     assert raw_tensor is not None
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
