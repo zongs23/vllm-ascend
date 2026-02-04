@@ -2361,7 +2361,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return kv_cache_raw_tensors
 
-    def _cal_kv_cache_tensor_split_size(self, kv_cache_config: KVCacheConfig, alignment: int) -> dict[str, list[int]]:
+    def _cal_kv_cache_tensor_split_size(self, kv_cache_config: KVCacheConfig, alignment: int) -> dict[str, list[int]], int:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
@@ -2378,6 +2378,7 @@ class NPUModelRunner(GPUModelRunner):
             to their corresponding memory buffer for K cache and V cache.
         """
         # init kv cache tensors
+        new_alignment = 0
         kv_cache_split_size_list: dict[str, list[int]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -2389,6 +2390,7 @@ class NPUModelRunner(GPUModelRunner):
                     tensor_size = kv_cache_tensor.size
                     if self.vllm_config.kv_transfer_config is not None:
                         tensor_size += alignment
+                        new_alignment += alignment
                     split_size_list = [tensor_size]
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
@@ -2431,8 +2433,11 @@ class NPUModelRunner(GPUModelRunner):
                     if self.vllm_config.kv_transfer_config is not None:
                         k_tensor_size += alignment
                         v_tensor_size += alignment
+                        new_alignment += alignment
+                        new_alignment += alignment
                         if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
                             dsa_k_cache_size += alignment
+                            new_alignment += alignment
 
                     split_size_list = [k_tensor_size, v_tensor_size]
                     if dsa_k_cache_factor is not None and dsa_k_cache_size is not None:
@@ -2442,7 +2447,7 @@ class NPUModelRunner(GPUModelRunner):
                         # shared the kvcache between the self_attn specs in the same group
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                             kv_cache_split_size_list[layer_name_inner] = split_size_list
-        return kv_cache_split_size_list
+        return kv_cache_split_size_list, new_alignment
 
     def _reshape_kv_cache_tensors(
         self,
