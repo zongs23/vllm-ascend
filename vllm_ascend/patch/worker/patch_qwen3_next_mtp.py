@@ -1,6 +1,6 @@
 import torch
 import vllm.v1.worker.utils as utils
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.utils import defaultdict, extract_layer_index
 
 

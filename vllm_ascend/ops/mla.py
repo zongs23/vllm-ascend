@@ -23,7 +23,7 @@ from typing import Optional
 
 import torch
 from torch import nn
-from vllm.attention.layer import MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context

@@ -30,7 +30,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from vllm.attention.layer import Attention, MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
@@ -2359,7 +2360,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         return kv_cache_raw_tensors
 
-    def _cal_kv_cache_tensor_split_size(self, kv_cache_config: KVCacheConfig, alignment: int) -> dict[str, list[int]], int:
+    def _cal_kv_cache_tensor_split_size(self, kv_cache_config: KVCacheConfig, alignment: int) -> tuple[dict[str, list[int]], int]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
